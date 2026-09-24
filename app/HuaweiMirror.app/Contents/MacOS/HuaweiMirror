@@ -1,0 +1,293 @@
+#!/bin/bash
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-cocoa}"
+export SDL_HINT_APP_NAME="华为镜像"
+export SDL_HINT_APP_ID="local.huawei.mirror"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export SCRCPY_ICON_DIR="${SCRIPT_DIR}/../Resources/scrcpy-icons"
+
+if [[ -z "${SCRCPY_SERVER_PATH:-}" ]]; then
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    if [[ -n "$brew_prefix" && -f "${brew_prefix}/share/scrcpy/scrcpy-server" ]]; then
+      export SCRCPY_SERVER_PATH="${brew_prefix}/share/scrcpy/scrcpy-server"
+    fi
+  fi
+  if [[ -z "${SCRCPY_SERVER_PATH:-}" ]]; then
+    for candidate in \
+      /opt/homebrew/share/scrcpy/scrcpy-server \
+      /usr/local/share/scrcpy/scrcpy-server
+    do
+      if [[ -f "$candidate" ]]; then
+        export SCRCPY_SERVER_PATH="$candidate"
+        break
+      fi
+    done
+  fi
+fi
+
+LOG_DIR="${HOME}/Library/Logs"
+mkdir -p "$LOG_DIR"
+LOG="${LOG_DIR}/HuaweiMirror.log"
+exec >>"$LOG" 2>&1
+
+echo "----- $(date '+%Y-%m-%d %H:%M:%S') start -----"
+
+ADB="$(command -v adb || true)"
+SCRCPY="$(command -v scrcpy || true)"
+CONF_DIR="${HOME}/Library/Application Support/HuaweiMirror"
+mkdir -p "$CONF_DIR"
+LAST_IP_FILE="${CONF_DIR}/last_ip.txt"
+
+json_str() {
+  printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False))'
+}
+
+alert() {
+  osascript - "$1" <<'EOF'
+on run argv
+  display dialog (item 1 of argv) with title "华为镜像" buttons {"好"} default button "好" with icon caution
+end run
+EOF
+}
+
+notify() {
+  osascript - "$1" <<'EOF'
+on run argv
+  display notification (item 1 of argv) with title "华为镜像"
+end run
+EOF
+}
+
+choose_mode() {
+  osascript <<'EOF'
+set r to button returned of (display dialog "请选择连接方式。
+
+无线连接：手机和 Mac 须在同一 Wi‑Fi。
+第一次请先插上数据线，开通后再拔线。" with title "华为镜像" buttons {"取消", "有线连接", "无线连接"} default button "有线连接")
+return r
+EOF
+}
+
+ask_ip() {
+  local default_ip="$1"
+  osascript <<EOF
+set r to text returned of (display dialog "请输入华为手机的 IP 地址。
+
+查看位置：设置 → WLAN → 当前网络。
+端口使用 5555。" with title "华为镜像" default answer $(json_str "$default_ip") buttons {"取消", "连接"} default button "连接")
+return r
+EOF
+}
+
+usb_device_line() {
+  "$ADB" devices 2>/dev/null | awk 'NR>1 && $2 != "" && $1 !~ /:/ {print $1, $2; exit}'
+}
+
+tcp_device_line() {
+  "$ADB" devices 2>/dev/null | awk 'NR>1 && $2 != "" && $1 ~ /:/ {print $1, $2; exit}'
+}
+
+phone_ip_from_usb() {
+  local serial="$1"
+  "$ADB" -s "$serial" shell ip route get 1.1.1.1 2>/dev/null | tr -d '\r' | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
+}
+
+wait_usb() {
+  local unauthorized_notified=0
+  local empty_notified=0
+  local deadline=$((SECONDS + 60))
+  serial=""
+  state=""
+  while (( SECONDS < deadline )); do
+    read -r serial state <<<"$(usb_device_line)"
+    if [[ "${state:-}" == "device" ]]; then
+      return 0
+    fi
+    if [[ "${state:-}" == "unauthorized" && "$unauthorized_notified" -eq 0 ]]; then
+      notify "手机已连接，请在手机上点「允许」USB 调试"
+      unauthorized_notified=1
+    fi
+    if [[ -z "${state:-}" && "$empty_notified" -eq 0 ]]; then
+      notify "未检测到手机，请用数据线连接，USB 选传输文件或照片"
+      empty_notified=1
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+if [[ -z "$ADB" || -z "$SCRCPY" ]]; then
+  alert "未找到 scrcpy 或 adb。请先运行仓库里的 install.sh，或在终端执行：
+brew install scrcpy
+brew install --cask android-platform-tools"
+  exit 1
+fi
+
+"$ADB" start-server >/dev/null 2>&1 || true
+
+mode="$(choose_mode || true)"
+echo "mode=$mode"
+if [[ "$mode" == "取消" || -z "$mode" ]]; then
+  exit 0
+fi
+
+serial=""
+state=""
+tcpip_arg=""
+bitrate="18M"
+max_size="1920"
+max_fps="60"
+video_buffer="0"
+
+if [[ "$mode" == "无线连接" ]]; then
+  bitrate="12M"
+  max_size="1920"
+  max_fps="60"
+  video_buffer="0"
+  read -r serial state <<<"$(tcp_device_line)"
+  if [[ "${state:-}" == "device" ]]; then
+    echo "already on wifi serial=$serial"
+    tcpip_arg=""
+    notify "已发现无线设备，正在打开投屏…"
+  else
+    read -r serial state <<<"$(usb_device_line)"
+    if [[ "${state:-}" == "device" ]]; then
+      phone_ip="$(phone_ip_from_usb "$serial" || true)"
+      echo "usb present, switch tcpip ip=${phone_ip:-}"
+      if [[ -n "${phone_ip:-}" ]]; then
+        printf '%s\n' "$phone_ip" >"$LAST_IP_FILE"
+      fi
+      notify "正在开通无线调试，成功后可以拔掉数据线。"
+      tcpip_arg="--tcpip"
+      serial=""
+    elif [[ "${state:-}" == "unauthorized" ]]; then
+      alert "手机未授权这台电脑。请先用数据线连接并在手机上点允许，再选无线连接。"
+      exit 1
+    else
+      last_ip=""
+      if [[ -f "$LAST_IP_FILE" ]]; then
+        last_ip="$(tr -d '[:space:]' <"$LAST_IP_FILE")"
+      fi
+      phone_ip="$(ask_ip "${last_ip:-192.168.}" || true)"
+      phone_ip="$(printf '%s' "$phone_ip" | tr -d '[:space:]')"
+      if [[ -z "$phone_ip" ]]; then
+        exit 0
+      fi
+      printf '%s\n' "$phone_ip" >"$LAST_IP_FILE"
+      notify "正在无线连接 ${phone_ip}…"
+      "$ADB" connect "${phone_ip}:5555" >/dev/null 2>&1 || true
+      tcpip_arg="--tcpip=+${phone_ip}:5555"
+      serial=""
+    fi
+  fi
+else
+  notify "正在连接华为手机…"
+  if ! wait_usb; then
+    if [[ "${state:-}" == "unauthorized" ]]; then
+      alert "手机未授权这台电脑。
+
+请解锁手机，USB 选「传输照片」或「传输文件」，
+在弹窗中勾选始终允许，然后点允许。
+授权后再打开本应用。"
+    else
+      alert "没有检测到华为手机。
+
+1. 用数据线连接到 Mac
+2. USB 模式选传输照片或传输文件
+3. 打开 USB 调试
+4. 再打开本应用"
+    fi
+    exit 1
+  fi
+fi
+
+if [[ -n "$serial" ]]; then
+  "$ADB" -s "$serial" shell cmd display power-on 0 >/dev/null 2>&1 || true
+  "$ADB" -s "$serial" shell input keyevent 224 >/dev/null 2>&1 || true
+fi
+sleep 0.4
+
+is_locked() {
+  local dump
+  local target="$1"
+  if [[ -z "$target" ]]; then
+    dump="$("$ADB" shell dumpsys window 2>/dev/null | tr -d '\r')"
+  else
+    dump="$("$ADB" -s "$target" shell dumpsys window 2>/dev/null | tr -d '\r')"
+  fi
+  echo "$dump" | grep -qiE 'mDreamingLockscreen=true|isStatusBarKeyguard=true|mKeyguardShowing=true|mShowingLockscreen=true'
+}
+
+lock_target="$serial"
+if is_locked "$lock_target"; then
+  echo "device locked: keep screen on"
+  notify "手机已锁屏：请在电脑窗口输入密码解锁。解锁后按 Option+O 可关掉手机屏幕。"
+else
+  echo "device unlocked: turn screen off"
+fi
+
+scrcpy_args=(
+  --stay-awake
+  --keep-active
+  --screen-off-timeout=86400
+  --disable-screensaver
+  --no-audio
+  --video-codec=h265
+  --video-codec-options=i-frame-interval=1,max-bframes=0
+  --mouse=sdk
+  --max-size="$max_size"
+  --max-fps="$max_fps"
+  --video-bit-rate="$bitrate"
+  --video-buffer="$video_buffer"
+  --render-driver=metal
+  --window-title "华为镜像"
+)
+if [[ -n "$serial" ]]; then
+  scrcpy_args+=(-s "$serial")
+fi
+if [[ -n "$tcpip_arg" ]]; then
+  scrcpy_args+=("$tcpip_arg")
+fi
+if ! is_locked "$lock_target"; then
+  scrcpy_args+=(--turn-screen-off)
+fi
+
+echo "start scrcpy args=${scrcpy_args[*]}"
+if [[ -x "${SCRIPT_DIR}/scrcpy-player" ]]; then
+  SCRCPY="${SCRIPT_DIR}/scrcpy-player"
+fi
+
+usb_serial="$(usb_device_line | awk '{print $1}')"
+adb_s() {
+  local s="${serial:-${usb_serial:-}}"
+  if [[ -n "$s" ]]; then
+    "$ADB" -s "$s" "$@"
+  else
+    "$ADB" "$@"
+  fi
+}
+
+# 华为/微信输入法会拦系统注入中文。有线用 AOA 实体键盘，无线用 UHID。
+adb_s shell settings put secure show_ime_with_hard_keyboard 1 >/dev/null 2>&1 || true
+python3 "${SCRIPT_DIR}/../Resources/type_to_phone.py" >>"$LOG" 2>&1 &
+disown || true
+
+kbd="uhid"
+if [[ "$mode" == "有线连接" || -n "${usb_serial:-}" ]]; then
+  kbd="aoa"
+fi
+echo "keyboard=$kbd"
+
+notify "请先点进手机输入框再打字。中文请用弹出的「发到手机」窗口，回车发送。"
+
+if ! "$SCRCPY" "${scrcpy_args[@]}" --keyboard="$kbd"; then
+  echo "$kbd failed, try uhid"
+  if ! "$SCRCPY" "${scrcpy_args[@]}" --keyboard=uhid; then
+    echo "uhid failed, fallback sdk prefer-text"
+    exec "$SCRCPY" "${scrcpy_args[@]}" --keyboard=sdk --prefer-text
+  fi
+fi
